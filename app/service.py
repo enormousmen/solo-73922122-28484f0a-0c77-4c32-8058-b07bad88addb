@@ -19,12 +19,12 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
-from datetime import date, datetime
+from datetime import date
 from typing import Any
 
 from fastapi import HTTPException
 
-from .db import get_conn, utcnow
+from .db import WORKER_INSTANCE_ID, get_conn, utcnow
 
 # 未归属原因
 REASON_NO_TIMELINE = "no_timeline"          # 客户尚无任何生效时间线
@@ -232,10 +232,10 @@ def submit_correction(customer_id: str, entries: list[dict[str, Any]],
             )
         cur = conn.execute(
             "INSERT INTO correction_job (customer_id, expected_version, new_version, "
-            "status, fail_simulation, backfill_delay_ms, note, submitted_at) "
-            "VALUES (?,?,?,?,?,?,?,?)",
+            "status, fail_simulation, backfill_delay_ms, note, submitted_at, owner_instance_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
             (customer_id, current, current + 1, "pending", 1 if fail_simulation else 0,
-             backfill_delay_ms, note, utcnow()),
+             backfill_delay_ms, note, utcnow(), WORKER_INSTANCE_ID),
         )
         job_id = cur.lastrowid
         # 客户级互斥：同客户已有进行中的回填则这里抛 IntegrityError（409），
@@ -275,30 +275,46 @@ def submit_correction(customer_id: str, entries: list[dict[str, Any]],
 # ---------------------------------------------------------------------------
 
 def _fail_job(conn: sqlite3.Connection, job_id: int, message: str) -> None:
+    """本实例把自己的任务标记失败。条件更新保证不会撤销恢复逻辑已做的收尾。"""
     conn.execute("BEGIN IMMEDIATE")
-    conn.execute(
-        "UPDATE correction_job SET status='failed', finished_at=?, error=? WHERE id=?",
-        (utcnow(), message, job_id),
+    cur = conn.execute(
+        "UPDATE correction_job SET status='failed', finished_at=?, error=? "
+        "WHERE id=? AND status IN ('pending', 'running') AND owner_instance_id=?",
+        (utcnow(), message, job_id, WORKER_INSTANCE_ID),
     )
-    conn.execute("DELETE FROM region_staging WHERE job_id=?", (job_id,))
-    conn.execute("DELETE FROM region_timeline WHERE status='backfill' AND job_id=?", (job_id,))
-    conn.execute("DELETE FROM correction_mutex WHERE job_id=?", (job_id,))
+    if cur.rowcount:
+        conn.execute("DELETE FROM region_staging WHERE job_id=?", (job_id,))
+        conn.execute(
+            "DELETE FROM region_timeline WHERE status='backfill' AND job_id=?", (job_id,))
+        conn.execute("DELETE FROM correction_mutex WHERE job_id=?", (job_id,))
     conn.execute("COMMIT")
 
 
 def run_backfill(job_id: int) -> None:
-    """后台线程执行：回填计算（不长期持写锁）→ 原子切换。"""
+    """后台线程执行：回填计算（不长期持写锁）→ 原子切换。
+
+    属主守卫：只执行归属本进程实例的任务；睡眠延迟期间若启动恢复已把本任务
+    判定失败并清理（暂存/backfill 时间线/客户互斥），醒来后的复查会发现状态
+    变化，静默退出，绝不重新写入暂存或覆盖 failed 结论。
+    """
     conn = get_conn()
     try:
         job = conn.execute("SELECT * FROM correction_job WHERE id=?", (job_id,)).fetchone()
         if job is None or job["status"] not in ("pending", "running"):
             return
+        # 归属防护：PID 复用/启动恢复后/其他实例的任务一律不接手
+        if job["owner_instance_id"] != WORKER_INSTANCE_ID:
+            return
+        # 条件认领 running：恢复逻辑可能已抢先收尾，rowcount=0 则退出
         conn.execute("BEGIN IMMEDIATE")
-        conn.execute(
-            "UPDATE correction_job SET status='running', started_at=? WHERE id=?",
-            (utcnow(), job_id),
+        cur = conn.execute(
+            "UPDATE correction_job SET status='running', started_at=? "
+            "WHERE id=? AND status IN ('pending', 'running') AND owner_instance_id=?",
+            (utcnow(), job_id, WORKER_INSTANCE_ID),
         )
         conn.execute("COMMIT")
+        if cur.rowcount == 0:
+            return
 
         customer_id = job["customer_id"]
         new_version = job["new_version"]
@@ -319,6 +335,20 @@ def run_backfill(job_id: int) -> None:
                            s["amount_cents"], region, REASON_STAGING_GAP if gap else None))
             if slice_ms:
                 time.sleep(slice_ms / 1000.0)
+        # 无历史销售时也要保留回填延迟窗口：便于演示回填期间的导入与重启恢复
+        if not sales and delay:
+            time.sleep(delay / 1000.0)
+
+        # 延迟醒来后复查：恢复/属主变更/状态变化则放弃，不能把暂存写回已清理的任务
+        fresh = conn.execute(
+            "SELECT status, owner_instance_id FROM correction_job WHERE id=?", (job_id,)
+        ).fetchone()
+        if fresh is None or fresh["status"] != "running" \
+                or fresh["owner_instance_id"] != WORKER_INSTANCE_ID:
+            return
+        # backfill 时间线若已被恢复删除，同样放弃
+        if not fetch_timeline(conn, customer_id, "backfill", new_version):
+            return
 
         # staging 批量写入：短暂写锁。
         conn.execute("BEGIN IMMEDIATE")
@@ -357,16 +387,16 @@ def _cutover(conn: sqlite3.Connection, job_id: int) -> None:
         job = conn.execute("SELECT * FROM correction_job WHERE id=?", (job_id,)).fetchone()
         if job is None or job["status"] != "running":
             raise RuntimeError("任务状态已变化，拒绝切换")
+        # 属主守卫：启动恢复可能已把本任务标 failed 并清理，此时不得再做切换
+        if job["owner_instance_id"] != WORKER_INSTANCE_ID:
+            raise RuntimeError("任务属主已变化（启动恢复已收尾），拒绝切换")
         customer_id = job["customer_id"]
         old_version = int(job["expected_version"])
         new_version = int(job["new_version"])
+        if not fetch_timeline(conn, customer_id, "backfill", new_version):
+            raise RuntimeError("回填时间线已被恢复清理，拒绝切换")
 
         # 回填期间新增/漏算的销售：切换事务内再次查库补算，保证一条都不丢。
-        staged_ids = {
-            r["sale_id"] for r in conn.execute(
-                "SELECT sale_id FROM region_staging WHERE job_id=?", (job_id,)
-            ).fetchall()
-        }
         timeline = fetch_timeline(conn, customer_id, "backfill", new_version)
         extra = conn.execute(
             "SELECT sale_id, txn_date, amount_cents FROM sales "

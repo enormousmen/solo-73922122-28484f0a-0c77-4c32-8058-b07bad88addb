@@ -41,6 +41,9 @@
   .pill.failed { background:#fee2e2; color:#991b1b; }
   .pill.gap { background:#fee2e2; color:#991b1b; }
   .pill.region { background:#dbeafe; color:#1e40af; }
+  .pill.alive { background:#dcfce7; color:#166534; }
+  .pill.dead { background:#e2e8f0; color:#475569; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; }
   .muted { color:var(--muted); font-size:12px; }
   .toast { position:fixed; right:24px; bottom:24px; max-width:420px; z-index:99;
            display:flex; flex-direction:column; gap:8px; }
@@ -138,8 +141,12 @@
       </div>
       <table id="jobsTable" style="margin-top:10px"><thead><tr>
         <th>任务</th><th>客户</th><th>状态</th><th>版本 v→v'</th><th>进度(已暂存/总数)</th>
-        <th>延迟ms</th><th>提交时间</th><th>完成时间</th><th>错误/备注</th>
+        <th>延迟ms</th><th>属主实例 / 存活</th><th>提交时间</th><th>完成时间</th><th>错误/备注</th>
       </tr></thead><tbody></tbody></table>
+      <p class="muted" style="margin-top:8px">
+        属主实例 = <code>主机名-PID-随机UUID</code>。另一进程重启时，只要属主心跳新鲜，任务/暂存/客户占用保持；
+        属主被强制终止（心跳超时/实例消失）后，任一进程启动会把任务标 failed 并释放客户。UUID 保证 PID 相同或被复用也能区分。
+      </p>
     </div>
   </section>
 
@@ -155,14 +162,29 @@
       <pre id="demoOut" style="margin-top:12px"></pre>
     </div>
     <div class="card">
+      <h2>双进程实例与启动恢复</h2>
+      <p class="muted">每个 Web 进程注册一个带随机 UUID 的实例并持续心跳。启动恢复只清理属主已死的遗留任务；
+        属主存活的活跃回填在另一容器启动 / 进程重启时原样保留。可手动触发与启动时完全相同的恢复逻辑。</p>
+      <div class="row">
+        <button class="act sec" onclick="loadWorkers()">刷新进程实例</button>
+        <button class="act danger" onclick="runRecover()">手动执行启动恢复</button>
+      </div>
+      <table id="workersTable" style="margin-top:10px"><thead><tr>
+        <th>实例 ID（主机-PID-UUID）</th><th>主机</th><th>PID</th><th>存活</th>
+        <th>心跳年龄(ms)</th><th>启动时间</th><th>最近心跳</th>
+      </tr></thead><tbody></tbody></table>
+      <pre id="recoverOut" style="margin-top:10px"></pre>
+    </div>
+    <div class="card">
       <h2>推荐演示流程</h2>
       <ol class="muted" style="line-height:1.9">
         <li>点「一键准备演示数据」，到 Tab① 查看 S1002（2026-03-31）当前挂「华东」，S1008 落空档未归属，C003 全部 no_timeline。</li>
-        <li>Tab② 载入 C001 追溯更正模板，回填延迟设 8000ms，提交；立刻回 Tab① 持续刷新——回填期间仍可导入销售、查询旧结果。</li>
-        <li>回填进行中再上传一次 CSV（重复 ID 跳过）或新增销售，验证切换事务会把期间新增销售一并纳入。</li>
+        <li>Tab② 载入 C001 追溯更正模板，回填延迟设 12000ms，提交；立刻回 Tab① 持续刷新——回填期间仍可导入销售、查询旧结果。</li>
+        <li>回填进行中再上传一次 CSV（重复 ID 跳过）或新增销售，验证切换事务会把期间新增销售一并纳入新版。</li>
+        <li>回填进行中在另一直连入口（<code>:8081</code>/<code>:8082</code>）重启另一进程：任务保持 running、暂存与客户占用不被清理，完成后照常切换。</li>
+        <li><code>docker kill</code> 正在执行回填的容器，再重启任一 Web 进程：遗留任务被标 failed、客户释放，旧归属与修订保留，可立即重新更正。</li>
         <li>同一客户并发提交第二份更正：第二份返回 409（互斥）；改旧 expected_version 提交则 409 stale_version。</li>
-        <li>任务成功后 S1002 改挂「华南」，时间线/销售归属同为 v2；勾选「模拟回填失败」可验证失败后旧版完整保留。</li>
-        <li>命令行：<code>docker compose restart web1 web2</code> 后数据与版本仍在；两个入口 <code>:8081</code> / <code>:8082</code> 由 nginx <code>:8080</code> 负载均衡。</li>
+        <li>任务成功后 S1002 改挂「华南」，时间线/销售归属同为新版；勾选「模拟回填失败」可验证失败后旧版完整保留。</li>
       </ol>
     </div>
   </section>
@@ -195,7 +217,10 @@ async function api(url, opts) {
   return data;
 }
 async function refreshHost() {
-  try { const h = await api('/api/health'); $('hostMeta').textContent = '当前响应进程：' + h.host; } catch(e) {}
+  try {
+    const h = await api('/api/health');
+    $('hostMeta').innerHTML = `当前响应进程：${h.host} · PID ${h.pid} · <span class="mono">${h.instance_id}</span>`;
+  } catch(e) {}
 }
 setInterval(refreshHost, 4000); refreshHost();
 
@@ -315,16 +340,42 @@ async function loadJobs() {
   const tb = $('jobsTable').querySelector('tbody'); tb.innerHTML = '';
   d.jobs.forEach(j => {
     const tr = document.createElement('tr');
+    const owner = j.owner_instance_id
+      ? `<span class="mono">${j.owner_instance_id}</span><br>
+         <span class="pill ${j.owner_alive ? 'alive' : 'dead'}">${j.owner_alive ? '属主存活' : '属主已死'}</span>`
+      : '—';
     tr.innerHTML = `<td>#${j.id}</td><td>${j.customer_id}</td>
       <td><span class="pill ${j.status}">${j.status}</span></td>
       <td>v${j.expected_version} → v${j.new_version}</td>
       <td>${j.staged_sales}/${j.total_sales}</td><td>${j.backfill_delay_ms}</td>
+      <td>${owner}</td>
       <td>${j.submitted_at}</td><td>${j.finished_at ?? '—'}</td>
       <td>${j.error ?? (j.note ?? '')}</td>`;
     tb.appendChild(tr);
   });
 }
 setInterval(() => { if ($('autoRefresh').checked && $('tab-jobs').style.display !== 'none') loadJobs(); }, 2000);
+
+// ---------- 进程实例与启动恢复 ----------
+async function loadWorkers() {
+  const d = await api('/api/admin/workers');
+  const tb = $('workersTable').querySelector('tbody'); tb.innerHTML = '';
+  d.workers.forEach(w => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td class="mono">${w.instance_id}${w.instance_id === d.current_instance_id ? '（本进程）' : ''}</td>
+      <td>${w.hostname}</td><td>${w.pid}</td>
+      <td><span class="pill ${w.alive ? 'alive' : 'dead'}">${w.alive ? '存活' : '已死'}</span></td>
+      <td>${w.heartbeat_age_ms}</td><td>${w.started_at}</td><td>${w.last_heartbeat}</td>`;
+    tb.appendChild(tr);
+  });
+}
+async function runRecover() {
+  const d = await api('/api/admin/recover', { method: 'POST' });
+  $('recoverOut').textContent = JSON.stringify(d, null, 2);
+  toast(d.reaped_job_ids.length
+    ? `已清理遗留任务：${d.reaped_job_ids.join(', ')}` : '无属主已死的遗留任务，活跃回填全部保留', 'info');
+  loadWorkers(); loadJobs();
+}
 
 // ---------- Tab4 ----------
 async function seedDemo() {

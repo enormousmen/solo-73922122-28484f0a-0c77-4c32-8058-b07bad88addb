@@ -14,11 +14,14 @@ from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import service
-from .db import get_conn, init_db
+from .db import (
+    WORKER_INSTANCE_ID, get_conn, init_db, is_worker_alive, list_workers,
+    recover_stale_jobs, register_worker, start_heartbeat,
+)
 from .sample_data import CORRECTION_SAMPLE_C001, SAMPLE_CSV, SEED_TIMELINES
 from .schemas import CorrectionIn
 
-app = FastAPI(title="销售地区归属追溯更正平台", version="1.0.0")
+app = FastAPI(title="销售地区归属追溯更正平台", version="1.1.0")
 
 _STATIC_DIR = Path(__file__).parent / "static"
 
@@ -37,12 +40,44 @@ def _spawn_backfill(job_id: int) -> None:
 
 @app.on_event("startup")
 def _startup() -> None:
-    init_db()
+    # 先做启动恢复：只清理属主已死（无注册行/心跳超时）的遗留任务；
+    # 另一容器仍在跑的回填，其属主心跳新鲜，任务与暂存原样保留。
+    reaped = init_db()
+    # 再登记本进程实例并启动心跳，之后本进程的任务才会被其他进程视为「属主存活」。
+    register_worker()
+    start_heartbeat()
+    if reaped:
+        # 走到这里说明上一个执行进程被强制终止，遗留任务已标 failed 并释放客户
+        print(f"[startup] recovered stale jobs: {reaped} by {WORKER_INSTANCE_ID}")
 
 
 @app.get("/api/health")
-def health() -> dict[str, str]:
-    return {"status": "ok", "host": socket.gethostname()}
+def health() -> dict:
+    return {"status": "ok", "host": socket.gethostname(),
+            "instance_id": WORKER_INSTANCE_ID, "pid": os.getpid()}
+
+
+# ---------------------------------------------------------------------------
+# 进程实例与启动恢复的可观测/手动触发入口（演示双进程归属判定）
+# ---------------------------------------------------------------------------
+
+@app.get("/api/admin/workers")
+def admin_workers() -> dict:
+    """所有 Web 进程实例：实例 ID（含 UUID，PID 相同也可区分）、PID、心跳与存活状态。"""
+    conn = get_conn()
+    try:
+        return {"current_instance_id": WORKER_INSTANCE_ID,
+                "workers": list_workers(conn), "served_by": socket.gethostname()}
+    finally:
+        conn.close()
+
+
+@app.post("/api/admin/recover")
+def admin_recover() -> dict:
+    """手动执行与启动时完全相同的恢复逻辑，返回被清理的遗留任务。"""
+    reaped = recover_stale_jobs()
+    return {"reaped_job_ids": reaped, "recovered_by": WORKER_INSTANCE_ID,
+            "served_by": socket.gethostname()}
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +264,12 @@ def list_jobs(customer_id: str | None = None) -> dict:
         else:
             rows = conn.execute(
                 "SELECT * FROM correction_job ORDER BY id DESC LIMIT 100")
-        return {"jobs": [dict(r) for r in rows], "served_by": socket.gethostname()}
+        jobs = [dict(r) for r in rows]
+        workers = {w["instance_id"]: w for w in list_workers(conn)}
+        for j in jobs:
+            owner = j.get("owner_instance_id")
+            j["owner_alive"] = workers[owner]["alive"] if owner in workers else False
+        return {"jobs": jobs, "served_by": socket.gethostname()}
     finally:
         conn.close()
 
@@ -242,6 +282,7 @@ def job_detail(job_id: int) -> dict:
         if not r:
             raise HTTPException(status_code=404, detail="任务不存在")
         d = dict(r)
+        d["owner_alive"] = is_worker_alive(conn, d.get("owner_instance_id"))
         d["staging_preview"] = [dict(x) for x in conn.execute(
             "SELECT sale_id, txn_date, amount_cents, region, reason "
             "FROM region_staging WHERE job_id=? ORDER BY sale_id", (job_id,))]
